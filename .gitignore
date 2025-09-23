@@ -1,0 +1,70 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Distribution / packaging
+asr-for-phoneme-detection-1/
+Datasets/
+phoneme_demo/
+SSL_aasist/
+tcm_add/
+
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Logs
+*.log
+
+# VSCode / PyCharm settings
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Data / Models (연구코드에서 특히 중요!)
+data/
+datasets/
+*.wav
+*.flac
+*.mp3
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.h5
+
+# Results / Outputs
+outputs/
+results/
+runs/
+logs/
+
+# Temporary files
+*.tmp
+*.bak
