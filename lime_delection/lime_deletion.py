@@ -375,13 +375,15 @@ def deletion_metric(model, waveform, segments, importances,
     return ratios_cut, confidences_cut, deletion_auc, stop_idx, flipped_to
     
 
-def run_dataset_experiment(model, dataset_path, protocol_path,
+def run_dataset(model, dataset_path, protocol_path,
                            batch_size=1, sr=16000, frame_ms=500,
                            num_samples=200, device="cuda",
                            output_csv="deletion_results.csv",
+                           log_file="deletion_experiment.log",
+                           summary_plot="dataset_summary.png",
                            logger=None):
     """
-    데이터셋 단위 Deletion Metric 실험 (logging 기록 포함)
+    데이터셋 단위 Deletion Metric 실험 (logging + tqdm + summary plot)
     """
     if logger is None:
         import logging
@@ -391,52 +393,50 @@ def run_dataset_experiment(model, dataset_path, protocol_path,
     df = pd.read_csv(protocol_path, sep=" ", header=None, names=["file_path", "label"])
     results = []
 
-    for i in tqdm(range(0, len(df), batch_size)):
-        batch = df.iloc[i:i+batch_size]
+    # tqdm으로 전체 파일 진행 표시
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing files"):
+        file_path = os.path.join(dataset_path, row["file_path"])
+        label = row["label"]
 
-        for _, row in batch.iterrows():
-            file_path = os.path.join(dataset_path, row["file_path"])
-            label = row["label"]
+        try:
+            wav, _ = librosa.load(file_path, sr=sr)
+            wav_tensor = torch.tensor(wav).float().unsqueeze(0).to(device)
 
-            try:
-                wav, _ = librosa.load(file_path, sr=sr)
-                wav_tensor = torch.tensor(wav).float().unsqueeze(0).to(device)
+            # Segmentation
+            segments, _ = segment_waveform_frames(wav_tensor, sr=sr, frame_ms=frame_ms)
 
-                # Segmentation
-                segments, _ = segment_waveform_frames(wav_tensor, sr=sr, frame_ms=frame_ms)
+            # LIME importances
+            importances, _, _ = lime_explain(
+                model, wav_tensor, audio_path=file_path,
+                mode="frame", sr=sr, frame_ms=frame_ms,
+                num_samples=num_samples, device=device, top_ratio=0.1
+            )
 
-                # LIME importances
-                importances, _, _ = lime_explain(
-                    model, wav_tensor, audio_path=file_path,
-                    mode="frame", sr=sr, frame_ms=frame_ms,
-                    num_samples=num_samples, device=device, top_ratio=0.1
-                )
+            # Deletion metric 실행
+            ratios, confs, auc_val, stop_idx, flipped_to = deletion_metric(
+                model, wav_tensor, segments, importances,
+                device=device, use_logit=False, plot=False, logger=logger
+            )
 
-                # Deletion metric 실행 (logger 전달)
-                ratios, confs, auc_val, stop_idx, flipped_to = deletion_metric(
-                    model, wav_tensor, segments, importances,
-                    device=device, use_logit=False, plot=False, logger=logger
-                )
+            stop_ratio = stop_idx / len(segments)
 
-                stop_ratio = stop_idx / len(segments)
+            results.append({
+                "file": file_path,
+                "label": label,
+                "auc": auc_val,
+                "stop_idx": stop_idx,
+                "stop_ratio": stop_ratio,
+                "flipped_to": flipped_to
+            })
 
-                results.append({
-                    "file": file_path,
-                    "label": label,
-                    "auc": auc_val,
-                    "stop_idx": stop_idx,
-                    "stop_ratio": stop_ratio,
-                    "flipped_to": flipped_to
-                })
+            logger.info(
+                f"[Sample Done] file={file_path}, label={label}, "
+                f"AUC={auc_val:.4f}, stop_idx={stop_idx}, stop_ratio={stop_ratio:.3f}, "
+                f"flipped_to={flipped_to}"
+            )
 
-                logger.info(
-                    f"[Sample Done] file={file_path}, label={label}, "
-                    f"AUC={auc_val:.4f}, stop_idx={stop_idx}, stop_ratio={stop_ratio:.3f}, "
-                    f"flipped_to={flipped_to}"
-                )
-
-            except Exception as e:
-                logger.error(f"[Error] file={file_path}: {e}")
+        except Exception as e:
+            logger.error(f"[Error] file={file_path}: {e}")
 
     # CSV 저장
     res_df = pd.DataFrame(results)
@@ -448,6 +448,19 @@ def run_dataset_experiment(model, dataset_path, protocol_path,
     logger.info(f"평균 AUC: {res_df['auc'].mean():.4f}")
     logger.info(f"평균 stop_ratio: {res_df['stop_ratio'].mean():.4f}")
     logger.info(f"\n{res_df.describe()}")
+
+    # 최종 summary plot 저장
+    plt.figure(figsize=(8, 5))
+    plt.hist(res_df["stop_ratio"], bins=20, alpha=0.7, label="Stop Ratio", color="blue")
+    plt.xlabel("Stop Ratio (제거 비율)")
+    plt.ylabel("Count")
+    plt.title("Distribution of Stop Ratios across Dataset")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(summary_plot)
+    plt.close()
+
+    logger.info(f"[Summary Plot Saved] {summary_plot}")
 
     return res_df
 
@@ -461,6 +474,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_samples", type=int, default=200)
     parser.add_argument("--output_csv", type=str, default="deletion_results.csv")
     parser.add_argument("--log_file", type=str, default="deletion_experiment.log")
+    parser.add_argument("--summary_plot", type=str, default="dataset_summary.png")
 
     args = parser.parse_args()
 
@@ -474,7 +488,7 @@ if __name__ == "__main__":
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    run_dataset_experiment(
+    run_dataset(
         model=model,
         dataset_path=args.dataset_path,
         protocol_path=args.protocol_path,
@@ -482,7 +496,9 @@ if __name__ == "__main__":
         sr=args.sr,
         frame_ms=args.frame_ms,
         num_samples=args.num_samples,
-        device=args.device,
+        device=device,
         output_csv=args.output_csv,
+        summary_plot=args.summary_plot,
+        log_file=args.log_file,
         logger=logger
     )
