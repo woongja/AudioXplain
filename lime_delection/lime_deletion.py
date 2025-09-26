@@ -8,6 +8,45 @@ from sklearn.metrics import auc
 
 # HuggingFace Whisper (word-level segmentation용)
 from transformers import pipeline
+from sklearn.metrics import auc
+
+import argparse
+import os
+import pandas as pd
+import torch
+import torch.nn as nn
+import librosa
+from tqdm import tqdm
+
+import sys
+sys.path.append('/home/woongjae/XAI')
+from SSL_aasist.model import Model
+
+import logging
+
+def setup_logger(log_path="deletion_experiment.log"):
+    logger = logging.getLogger("DeletionMetric")
+    logger.setLevel(logging.INFO)
+
+    # Formatter
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # File handler
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+
+    # Stream handler (console)
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(formatter)
+
+    # 중복 방지
+    if not logger.handlers:
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+
+    return logger
 
 # --------------------------
 # Segmentation
@@ -256,3 +295,194 @@ def deletion_metric(model, waveform, segments, importances, target_class=None,
         plt.show()
 
     return ratios, confidences, deletion_auc
+
+def deletion_metric(model, waveform, segments, importances,
+                           target_class=None, device="cpu", use_logit=False,
+                           plot=True, logger=None):
+    """
+    Deletion metric (binary classification, class flip 기준, logging 기록)
+    """
+    if logger is None:
+        import logging
+        logger = logging.getLogger("DeletionMetric")
+
+    model.eval()
+    waveform = waveform.to(device)
+
+    # baseline prediction
+    with torch.no_grad():
+        out = model(waveform)
+        prob = torch.softmax(out, dim=1)
+        if target_class is None:
+            target_class = torch.argmax(prob, dim=1).item()
+        base_score = prob[0, target_class].item()
+        logger.info(f"[Baseline] pred={target_class}, score={base_score:.4f}")
+
+    sorted_idx = np.argsort(np.abs(importances))[::-1]
+
+    confidences = [base_score]
+    ratios = [0.0]
+
+    modified = waveform.clone()
+    stop_idx = len(sorted_idx)
+    flipped_to = None
+
+    for step, idx in enumerate(sorted_idx, start=1):
+        start, end = segments[idx]
+        modified[0, start:end] = 0.0
+
+        with torch.no_grad():
+            out = model(modified)
+            prob_new = torch.softmax(out, dim=1)
+            score = prob_new[0, target_class].item()
+            pred_new = torch.argmax(prob_new, dim=1).item()
+
+        confidences.append(score)
+        ratios.append(step / len(sorted_idx))
+
+        # 🔥 클래스 flip 감지
+        if pred_new != target_class:
+            stop_idx = step
+            flipped_to = pred_new
+            logger.info(
+                f"[Flip Detected] step={step} ({ratios[-1]*100:.1f}% 제거) "
+                f"원래={target_class} → 바뀐={flipped_to}, "
+                f"confidence={score:.4f}"
+            )
+            break
+
+    # cut-off까지 AUC 계산
+    ratios_cut = ratios[:stop_idx+1]
+    confidences_cut = confidences[:stop_idx+1]
+    deletion_auc = auc(ratios_cut, confidences_cut)
+
+    logger.info(
+        f"[Result] AUC={deletion_auc:.4f}, stopped at {stop_idx}/{len(segments)}, "
+        f"원래={target_class}, 바뀐={flipped_to}"
+    )
+
+    if plot:
+        plt.figure(figsize=(6, 4))
+        plt.fill_between(ratios_cut, confidences_cut, alpha=0.3)
+        plt.plot(ratios_cut, confidences_cut, marker="o", linewidth=1, color="red")
+        plt.xlabel("Segments removed")
+        plt.ylabel(f"P[class={target_class}]")
+        plt.title(f"Deletion AUC (cut-off) = {deletion_auc:.4f}")
+        plt.ylim(0, 1)
+        plt.tight_layout()
+        plt.show()
+
+    return ratios_cut, confidences_cut, deletion_auc, stop_idx, flipped_to
+    
+
+def run_dataset_experiment(model, dataset_path, protocol_path,
+                           batch_size=1, sr=16000, frame_ms=500,
+                           num_samples=200, device="cuda",
+                           output_csv="deletion_results.csv",
+                           logger=None):
+    """
+    데이터셋 단위 Deletion Metric 실험 (logging 기록 포함)
+    """
+    if logger is None:
+        import logging
+        logger = logging.getLogger("DeletionMetric")
+
+    model.eval()
+    df = pd.read_csv(protocol_path, sep=" ", header=None, names=["file_path", "label"])
+    results = []
+
+    for i in tqdm(range(0, len(df), batch_size)):
+        batch = df.iloc[i:i+batch_size]
+
+        for _, row in batch.iterrows():
+            file_path = os.path.join(dataset_path, row["file_path"])
+            label = row["label"]
+
+            try:
+                wav, _ = librosa.load(file_path, sr=sr)
+                wav_tensor = torch.tensor(wav).float().unsqueeze(0).to(device)
+
+                # Segmentation
+                segments, _ = segment_waveform_frames(wav_tensor, sr=sr, frame_ms=frame_ms)
+
+                # LIME importances
+                importances, _, _ = lime_explain(
+                    model, wav_tensor, audio_path=file_path,
+                    mode="frame", sr=sr, frame_ms=frame_ms,
+                    num_samples=num_samples, device=device, top_ratio=0.1
+                )
+
+                # Deletion metric 실행 (logger 전달)
+                ratios, confs, auc_val, stop_idx, flipped_to = deletion_metric(
+                    model, wav_tensor, segments, importances,
+                    device=device, use_logit=False, plot=False, logger=logger
+                )
+
+                stop_ratio = stop_idx / len(segments)
+
+                results.append({
+                    "file": file_path,
+                    "label": label,
+                    "auc": auc_val,
+                    "stop_idx": stop_idx,
+                    "stop_ratio": stop_ratio,
+                    "flipped_to": flipped_to
+                })
+
+                logger.info(
+                    f"[Sample Done] file={file_path}, label={label}, "
+                    f"AUC={auc_val:.4f}, stop_idx={stop_idx}, stop_ratio={stop_ratio:.3f}, "
+                    f"flipped_to={flipped_to}"
+                )
+
+            except Exception as e:
+                logger.error(f"[Error] file={file_path}: {e}")
+
+    # CSV 저장
+    res_df = pd.DataFrame(results)
+    res_df.to_csv(output_csv, index=False)
+
+    # 전체 통계 로그
+    logger.info("\n=== Dataset Summary ===")
+    logger.info(f"총 샘플 수: {len(res_df)}")
+    logger.info(f"평균 AUC: {res_df['auc'].mean():.4f}")
+    logger.info(f"평균 stop_ratio: {res_df['stop_ratio'].mean():.4f}")
+    logger.info(f"\n{res_df.describe()}")
+
+    return res_df
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_path", type=str, required=True, help="Dataset root path")
+    parser.add_argument("--protocol_path", type=str, required=True, help="Protocol file path")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--sr", type=int, default=16000)
+    parser.add_argument("--frame_ms", type=int, default=500)
+    parser.add_argument("--num_samples", type=int, default=200)
+    parser.add_argument("--output_csv", type=str, default="deletion_results.csv")
+    parser.add_argument("--log_file", type=str, default="deletion_experiment.log")
+
+    args = parser.parse_args()
+
+    logger = setup_logger(args.log_file)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model_path = "/home/woongjae/XAI/SSL_aasist/Best_LA_model_for_DF.pth"
+    model = Model(None, device)
+    model = nn.DataParallel(model).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    run_dataset_experiment(
+        model=model,
+        dataset_path=args.dataset_path,
+        protocol_path=args.protocol_path,
+        batch_size=args.batch_size,
+        sr=args.sr,
+        frame_ms=args.frame_ms,
+        num_samples=args.num_samples,
+        device=args.device,
+        output_csv=args.output_csv,
+        logger=logger
+    )

@@ -8,6 +8,7 @@ from sklearn.metrics import auc
 
 # HuggingFace Whisper (word-level segmentation용)
 from transformers import pipeline
+from sklearn.metrics import auc
 
 # --------------------------
 # Segmentation
@@ -256,3 +257,79 @@ def deletion_metric(model, waveform, segments, importances, target_class=None,
         plt.show()
 
     return ratios, confidences, deletion_auc
+
+def deletion_metric(model, waveform, segments, importances,
+                           target_class=None, device="cpu", use_logit=False,
+                           stop_threshold=0.05, plot=True):
+    """
+    Deletion metric (binary classification 전용):
+    - 중요도 높은 순서대로 segment 제거
+    - confidence가 처음 stop_threshold 이하로 떨어지면 거기서 cut-off
+    Args:
+        model: PyTorch 모델
+        waveform: [1, T] torch waveform
+        segments: [(start, end), ...]
+        importances: LIME importances
+        target_class: 분석할 class index (None이면 baseline 예측 사용)
+        stop_threshold: confidence cut-off 값 (기본 0.05)
+        plot: 그래프 출력 여부
+    Return:
+        ratios, confidences, deletion_auc, stop_idx
+    """
+    model.eval()
+    waveform = waveform.to(device)
+
+    # baseline prediction
+    with torch.no_grad():
+        out = model(waveform)
+        prob = torch.softmax(out, dim=1)
+        if target_class is None:
+            target_class = torch.argmax(prob, dim=1).item()
+        base_score = out[0, target_class].item() if use_logit else prob[0, target_class].item()
+
+    print(f"[Deletion-Binary] target_class={target_class}, baseline={base_score:.4f}")
+
+    # 중요도 순 정렬 (내림차순)
+    sorted_idx = np.argsort(np.abs(importances))[::-1]
+
+    confidences = [base_score]
+    ratios = [0.0]
+
+    modified = waveform.clone()
+    stop_idx = len(sorted_idx)  # 기본적으로 끝까지
+
+    for step, idx in enumerate(sorted_idx, start=1):
+        start, end = segments[idx]
+        modified[0, start:end] = 0.0  # silence masking
+
+        with torch.no_grad():
+            out = model(modified)
+            score = out[0, target_class].item() if use_logit else torch.softmax(out, dim=1)[0, target_class].item()
+
+        confidences.append(score)
+        ratios.append(step / len(sorted_idx))
+
+        # 🔥 최초로 threshold 이하로 떨어지면 stop
+        if score <= stop_threshold:
+            stop_idx = step
+            break
+
+    # 잘라낸 부분까지만 AUC 계산
+    ratios_cut = ratios[:stop_idx+1]
+    confidences_cut = confidences[:stop_idx+1]
+    deletion_auc = auc(ratios_cut, confidences_cut)
+
+    if plot:
+        plt.figure(figsize=(6, 4))
+        plt.fill_between(ratios_cut, confidences_cut, alpha=0.3)
+        plt.plot(ratios_cut, confidences_cut, marker="o", linewidth=1, color="red")
+        plt.xlabel("Segments removed")
+        plt.ylabel(f"P[class={target_class}]")
+        plt.title(f"Deletion AUC (cut-off) = {deletion_auc:.4f}")
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+        plt.tight_layout()
+        plt.show()
+
+    return ratios_cut, confidences_cut, deletion_auc, stop_idx
+    
